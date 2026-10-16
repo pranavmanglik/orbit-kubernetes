@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
+import ipaddress
 import re
 import time
 from collections import OrderedDict
@@ -72,13 +74,17 @@ class KubernetesServiceDiscovery:
             raise ValueError("namespace must be a lowercase Kubernetes DNS label.")
         if not isinstance(port_name, str) or _PORT_NAME.fullmatch(port_name) is None:
             raise ValueError("port_name must be a valid lowercase Kubernetes port name.")
-        if scheme not in {"http", "https"}:
+        if not isinstance(scheme, str) or scheme not in {"http", "https"}:
             raise ValueError("scheme must be http or https.")
         _bounded_number(cache_ttl, "cache_ttl", 0.0, 300.0)
         _bounded_int(max_cache_services, "max_cache_services", 1, _MAX_CACHE_SERVICES)
         _bounded_int(page_size, "page_size", 1, 500)
         _bounded_int(max_pages, "max_pages", 1, 64)
         _bounded_number(request_timeout, "request_timeout", 0.05, 60.0)
+        if not callable(getattr(api, "list_namespaced_endpoint_slice", None)):
+            raise TypeError("api must provide an async EndpointSlice listing operation.")
+        if close is not None and not callable(close):
+            raise TypeError("close must be callable or None.")
         self._api = api
         self._namespace = namespace
         self._port_name = port_name
@@ -110,6 +116,7 @@ class KubernetesServiceDiscovery:
         """Load user kubeconfig into an isolated async client configuration."""
         client, config = _load_sdk()
         configuration = client.Configuration()
+        api_client: Any | None = None
         try:
             await config.load_kube_config(
                 config_file=config_file,
@@ -117,12 +124,22 @@ class KubernetesServiceDiscovery:
                 client_configuration=configuration,
             )
             api_client = client.ApiClient(configuration=configuration)
+            api = client.DiscoveryV1Api(api_client)
         except asyncio.CancelledError:
+            if api_client is not None:
+                await _close_factory_client(api_client)
             raise
         except Exception:
+            if api_client is not None:
+                await _close_factory_client(api_client)
             raise DiscoveryError("Could not configure the Kubernetes API client.") from None
-        api = client.DiscoveryV1Api(api_client)
-        return cls(api, namespace=namespace, port_name=port_name, close=api_client.close, **options)
+        try:
+            return cls(
+                api, namespace=namespace, port_name=port_name, close=api_client.close, **options
+            )
+        except BaseException:
+            await _close_factory_client(api_client)
+            raise
 
     @classmethod
     async def in_cluster(
@@ -135,17 +152,28 @@ class KubernetesServiceDiscovery:
         """Load service-account credentials into an isolated in-cluster client."""
         client, config = _load_sdk()
         configuration = client.Configuration()
+        api_client: Any | None = None
         try:
             config.load_incluster_config(client_configuration=configuration)
             api_client = client.ApiClient(configuration=configuration)
+            api = client.DiscoveryV1Api(api_client)
         except asyncio.CancelledError:
+            if api_client is not None:
+                await _close_factory_client(api_client)
             raise
         except Exception:
+            if api_client is not None:
+                await _close_factory_client(api_client)
             raise DiscoveryError(
                 "Could not configure the in-cluster Kubernetes API client."
             ) from None
-        api = client.DiscoveryV1Api(api_client)
-        return cls(api, namespace=namespace, port_name=port_name, close=api_client.close, **options)
+        try:
+            return cls(
+                api, namespace=namespace, port_name=port_name, close=api_client.close, **options
+            )
+        except BaseException:
+            await _close_factory_client(api_client)
+            raise
 
     async def resolve(self, service: str) -> tuple[ServiceInstance, ...]:
         """Return a cached or freshly listed endpoint snapshot for one Service."""
@@ -230,7 +258,13 @@ class KubernetesServiceDiscovery:
                     _continue=continuation,
                     _request_timeout=self._request_timeout,
                 )
-                for slice_item in getattr(page, "items", ()):
+                items = getattr(page, "items", None)
+                if not isinstance(items, list) or len(items) > self._page_size:
+                    raise DiscoveryError("Kubernetes returned an invalid EndpointSlice page.")
+                for slice_item in items:
+                    address_type = getattr(slice_item, "address_type", None)
+                    if address_type not in {"IPv4", "IPv6"}:
+                        raise DiscoveryError("Kubernetes returned an unsupported endpoint type.")
                     ports = _slice_ports(slice_item, self._port_name)
                     for endpoint in getattr(slice_item, "endpoints", ()) or ():
                         count += 1
@@ -248,6 +282,7 @@ class KubernetesServiceDiscovery:
                                     address,
                                     port,
                                     self._scheme,
+                                    address_type,
                                 )
                                 result[(instance.host, instance.port)] = instance
                                 if len(result) > _MAX_ENDPOINTS:
@@ -292,8 +327,18 @@ def _make_instance(
     address: str,
     port: int,
     scheme: str,
+    address_type: str,
 ) -> ServiceInstance:
-    """Create a stable opaque endpoint identifier without leaking cluster metadata."""
+    """Create a stable endpoint from a canonical IP of the slice's declared address family."""
+    try:
+        parsed_address = ipaddress.ip_address(address)
+    except (TypeError, ValueError):
+        raise DiscoveryError("Kubernetes returned an invalid endpoint IP address.") from None
+    if (address_type == "IPv4" and parsed_address.version != 4) or (
+        address_type == "IPv6" and parsed_address.version != 6
+    ):
+        raise DiscoveryError("Kubernetes endpoint IP does not match its address type.")
+    address = parsed_address.compressed
     digest = hashlib.sha256(f"{namespace}\0{service}\0{address}\0{port}".encode()).hexdigest()[:32]
     return ServiceInstance(
         service=service,
@@ -337,12 +382,23 @@ def _bounded_number(
 def _load_sdk() -> tuple[Any, Any]:
     """Import the optional async provider SDK only when a real client is requested."""
     try:
-        from kubernetes_asyncio import client, config
+        client = importlib.import_module("kubernetes_asyncio.client")
+        config = importlib.import_module("kubernetes_asyncio.config")
     except ImportError:
         raise RuntimeError(
             "Install orbit-kubernetes[kubernetes] to use Kubernetes client factories."
         ) from None
     return client, config
+
+
+async def _close_factory_client(api_client: Any) -> None:
+    """Best-effort close a partially configured SDK client without masking setup failures."""
+    try:
+        result = api_client.close()
+        if hasattr(result, "__await__"):
+            await result
+    except BaseException:
+        return
 
 
 __all__ = ["KubernetesServiceDiscovery"]

@@ -23,8 +23,14 @@ def slice_item(
     name: str,
     endpoints: list[NS],
     ports: list[NS] | None = None,
+    address_type: str = "IPv4",
 ) -> NS:
-    return NS(metadata=NS(name=name), endpoints=endpoints, ports=ports or [port("http", 8080)])
+    return NS(
+        metadata=NS(name=name),
+        address_type=address_type,
+        endpoints=endpoints,
+        ports=ports or [port("http", 8080)],
+    )
 
 
 def page(items: list[NS], continuation: str | None = None) -> NS:
@@ -82,8 +88,11 @@ async def test_resolves_ready_addresses_by_named_tcp_port_and_uses_endpoint_slic
 async def test_follows_pages_deduplicates_and_caches_immutable_snapshots() -> None:
     api = FakeApi(
         [
-            page([slice_item("catalog-a", [endpoint("2001:db8::1", None)])], "next"),
-            page([slice_item("catalog-b", [endpoint("2001:db8::1")])]),
+            page(
+                [slice_item("catalog-a", [endpoint("2001:db8::1", None)], address_type="IPv6")],
+                "next",
+            ),
+            page([slice_item("catalog-b", [endpoint("2001:db8::1")], address_type="IPv6")]),
         ]
     )
     discovery = resolver(api, cache_ttl=30)
@@ -147,6 +156,35 @@ async def test_not_found_is_empty_and_other_limits_fail_closed() -> None:
         FakeApi([page([], "page-2"), page([], "page-3")]), max_pages=1, cache_ttl=0
     )
     with pytest.raises(DiscoveryError, match="page limit"):
+        await discovery.resolve("catalog")
+    await discovery.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rejects_unsupported_address_types_and_oversized_api_pages() -> None:
+    discovery = resolver(
+        FakeApi(
+            [page([slice_item("catalog-a", [endpoint("attacker.example")], address_type="FQDN")])]
+        )
+    )
+    with pytest.raises(DiscoveryError, match="unsupported endpoint type"):
+        await discovery.resolve("catalog")
+    await discovery.aclose()
+
+    discovery = resolver(
+        FakeApi(
+            [
+                page(
+                    [
+                        slice_item("catalog-a", [endpoint("10.0.0.1")]),
+                        slice_item("catalog-b", [endpoint("10.0.0.2")]),
+                    ]
+                )
+            ]
+        ),
+        page_size=1,
+    )
+    with pytest.raises(DiscoveryError, match="invalid EndpointSlice page"):
         await discovery.resolve("catalog")
     await discovery.aclose()
 
@@ -217,6 +255,10 @@ async def test_in_cluster_factory_accepts_sync_loader_and_owns_isolated_client(
     assert state["loaded_configuration"] is state["configuration"]
     assert await discovery.resolve("catalog") == ()
     await discovery.aclose()
+    assert state["closed"] is True
+
+    with pytest.raises(ValueError, match="namespace"):
+        await KubernetesServiceDiscovery.in_cluster(namespace="Bad/namespace", port_name="http")
     assert state["closed"] is True
 
 

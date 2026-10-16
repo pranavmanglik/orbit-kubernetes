@@ -1,0 +1,71 @@
+# Reference example only. Install compatible KEDA HTTP Add-on and Gateway API releases first.
+# Replace the hostname, namespace, workload, service, and gateway names for the target cluster.
+apiVersion: http.keda.sh/v1beta1
+kind: InterceptorRoute
+metadata:
+  name: orbit-core
+  namespace: orbit
+spec:
+  target:
+    service: orbit-core
+    port: 8000
+  rules:
+    - hosts:
+        - app.example.com
+  scalingMetric:
+    concurrency:
+      targetValue: 32
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: orbit-core
+  namespace: orbit
+spec:
+  scaleTargetRef:
+    name: orbit-core
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  pollingInterval: 15
+  cooldownPeriod: 300
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: keda-add-ons-http-external-scaler.keda:9090
+        interceptorRoute: orbit-core
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: orbit-core-keda-interceptor
+  namespace: keda
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: orbit
+  to:
+    - group: ""
+      kind: Service
+      name: keda-add-ons-http-interceptor-proxy
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: orbit-core-scale-to-zero
+  namespace: orbit
+spec:
+  parentRefs:
+    - name: orbit-public
+      sectionName: https
+  hostnames:
+    - app.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: keda-add-ons-http-interceptor-proxy
+          namespace: keda
+          port: 8080

@@ -4,7 +4,7 @@
 adapter implements `orbit_discovery.ServiceDiscovery`; Core and `orbit-discovery` remain free of
 Kubernetes SDK dependencies.
 
-This package is pre-alpha and supports Python 3.11–3.14. The Kubernetes client is an optional
+This package is in alpha and supports Python 3.11–3.14. The Kubernetes client is an optional
 extra:
 
 ```bash
@@ -26,19 +26,12 @@ shutdown:
 ```python
 from orbit_kubernetes import KubernetesServiceDiscovery
 
-discovery = await KubernetesServiceDiscovery.in_cluster(
-    namespace="shop",
-    port_name="http",
-    scheme="https",
-    cache_ttl=5,
-)
-
-instances = await discovery.resolve("catalog")
-try:
+async with await KubernetesServiceDiscovery.in_cluster(
+    namespace="shop", port_name="http", scheme="https", cache_ttl=5
+) as discovery:
+    instances = await discovery.resolve("catalog")
     for instance in instances:
         print(instance.base_url)
-finally:
-    await discovery.aclose()
 ```
 
 For local development, use `from_kubeconfig(namespace="shop", port_name="http")`. Both factories
@@ -50,17 +43,28 @@ EndpointSlices labeled for the requested Service.
 
 - Reads Kubernetes `discovery.k8s.io/v1` EndpointSlices, not the legacy Endpoints API. EndpointSlice
   is Kubernetes' scalable backend representation and supports IPv4 and IPv6.
+- Accepts only EndpointSlices declaring IPv4 or IPv6, and validates each address against that
+  family. Deprecated FQDN address slices are rejected rather than converted into arbitrary DNS
+  destinations.
 - A configured named Service port is required. Only TCP endpoints with that port name are returned.
 - Explicitly unready endpoints are filtered. Kubernetes defines an unset `ready` condition as
   ready, so unset values remain eligible.
 - Results are deterministic immutable `ServiceInstance` snapshots, deduplicated by host and port.
   The adapter does not choose an instance, connect to it, or perform health checks.
-- Refreshes are coalesced per service using bounded lock striping. The cache, API request timeout,
-  pages, page size, total endpoints, and cache capacity have finite limits.
+- Refreshes are coalesced per service using bounded lock striping. Pages cannot exceed the
+  requested page size; total endpoint records are capped at 4,096. Cache capacity, page count, page
+  size, TTL, and API request timeout have finite configuration bounds.
 - API failures become `DiscoveryError` without copying provider error details or credentials into
   messages. Task cancellation propagates. A missing Service resolves to an empty tuple.
 - This adapter does not watch EndpointSlices. Lookups reflect the Kubernetes API at the time of
   the last cache refresh; choose a short cache TTL to limit staleness.
+- This package currently provides service discovery only. It does not provision Deployments,
+  autoscaling policies, scale-to-zero controllers, service-mesh mTLS, or certificate rotation;
+  those belong to separately operated Kubernetes controllers and platform policy.
+
+The [scale-to-zero deployment example](docs/deployment/scale-to-zero.md) documents an optional
+KEDA HTTP Add-on integration for stateless HTTP workloads. It is a cluster deployment example, not
+an autoscaler implementation bundled by this Python adapter.
 
 The Kubernetes identity should have read-only `list` permission for EndpointSlices in the selected
 namespace. Avoid cluster-wide roles for this adapter. Network egress policy still needs to validate

@@ -1,0 +1,13 @@
+# Apply only after the selected workload has an Istio data plane and all callers use the mesh.
+# Replace namespace and selector labels to match the receiving workload.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: orbit-core-mtls
+  namespace: orbit
+spec:
+  selector:
+    matchLabels:
+      app: orbit-core
+  mtls:
+    mode: STRICT

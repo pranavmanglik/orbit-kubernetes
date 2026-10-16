@@ -7,6 +7,8 @@ This directory contains the package-specific guides. Start with the [package REA
 - [Architecture and contract boundaries](architecture/overview.md)
 - [Architecture decision records](architecture/adr/README.md)
 - [Operations and deployment limits](operations/README.md)
+- [HTTP scale-to-zero with KEDA](deployment/scale-to-zero.md)
+- [Service-to-service mTLS with Istio](deployment/service-to-service-mtls.md)
 - [Security guidance](security/overview.md)
 - [Development and local validation](development/README.md)
 

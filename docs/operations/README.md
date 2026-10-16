@@ -1,55 +1,111 @@
-# Orbit Kubernetes: operations and security
+# Orbit Kubernetes: operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+For an optional HTTP workload scale-to-zero deployment example, see the [KEDA integration
+guide](../deployment/scale-to-zero.md). The Python adapter itself manages Kubernetes discovery
+reads and does not own workload scaling.
 
-## Configuration surface
+For an opt-in service-mesh mTLS policy, see the [Istio deployment
+guide](../deployment/service-to-service-mtls.md). Do not enable strict mode until callers and the
+ingress path have been migrated to the mesh.
 
-Environment names found in the package README:
-
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
-
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
-
-## Lifecycle, failure behavior, and limits
-
-`orbit-kubernetes` is the Kubernetes provider adapter for Orbit capability packages. The first
-adapter implements `orbit_discovery.ServiceDiscovery`; Core and `orbit-discovery` remain free of
-Kubernetes SDK dependencies.
-
-This package is pre-alpha and supports Python 3.11–3.14. The Kubernetes client is an optional
-extra:
+`orbit-kubernetes` resolves service backends from Kubernetes `discovery.k8s.io/v1` EndpointSlices.
+Install the optional async SDK only when using this Python adapter:
 
 ```bash
 python -m pip install 'orbit-kubernetes[kubernetes]'
 ```
 
-Orbit also provides a separately installable Go process-plugin variant, `orbit-kubernetes-go`, for
-deployments that prefer a standalone Go provider process. Both variants implement the same
-`orbit.discovery.v1` contract. Select one explicitly in application wiring: the Python variant
-registers `KubernetesServiceDiscovery`; the Go variant is supervised by Core and exposed through
-`orbit-discovery[process]`'s `ProcessServiceDiscovery`. Core remains Python in both cases.
+The default factory for a pod uses its mounted service-account configuration:
 
-## Behavior and limits
+```python
+async with await KubernetesServiceDiscovery.in_cluster(
+    namespace="shop",
+    port_name="http",
+    scheme="https",
+    cache_ttl=5.0,
+) as discovery:
+    instances = await discovery.resolve("catalog")
+```
 
-- Reads Kubernetes `discovery.k8s.io/v1` EndpointSlices, not the legacy Endpoints API. EndpointSlice
-  is Kubernetes' scalable backend representation and supports IPv4 and IPv6.
-- A configured named Service port is required. Only TCP endpoints with that port name are returned.
-- Explicitly unready endpoints are filtered. Kubernetes defines an unset `ready` condition as
-  ready, so unset values remain eligible.
-- Results are deterministic immutable `ServiceInstance` snapshots, deduplicated by host and port.
-  The adapter does not choose an instance, connect to it, or perform health checks.
-- Refreshes are coalesced per service using bounded lock striping. The cache, API request timeout,
-  pages, page size, total endpoints, and cache capacity have finite limits.
-- API failures become `DiscoveryError` without copying provider error details or credentials into
-  messages. Task cancellation propagates. A missing Service resolves to an empty tuple.
-- This adapter does not watch EndpointSlices. Lookups reflect the Kubernetes API at the time of
-  the last cache refresh; choose a short cache TTL to limit staleness.
+For local development, use `from_kubeconfig(namespace=..., port_name=...)`. The `scheme` option
+controls the URL scheme returned for discovered application endpoints; it does not configure TLS
+for the Kubernetes API client. Kubeconfig or in-cluster SDK settings configure that separate
+control-plane connection. Factories create isolated client configurations rather than mutating
+global SDK configuration.
 
-The Kubernetes identity should have read-only `list` permission for EndpointSlices in the selected
-namespace. Avoid cluster-wide roles for this adapter. Network egress policy still needs to validate
-discovered addresses before an application connects to them; discovery results are not an SSRF
-defense.
+## Core resource ownership
 
-## Production validation
+Register the adapter as a managed container resource so Core closes it with the application:
 
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+```python
+from contextlib import asynccontextmanager
+
+from orbit_discovery import DISCOVERY_DEPENDENCY_KEY
+from orbit_kubernetes import KubernetesServiceDiscovery
+
+
+@asynccontextmanager
+async def discovery_resource(_container):
+    async with await KubernetesServiceDiscovery.in_cluster(
+        namespace="shop", port_name="http"
+    ) as discovery:
+        yield discovery
+
+
+application.container.register_resource(DISCOVERY_DEPENDENCY_KEY, discovery_resource)
+```
+
+Without a managed container registration, the code that creates the resolver owns `aclose()`.
+Shutdown stops new lookups, drains active resolutions, clears cached snapshots, and closes the owned
+API client once. A cancellation during a lookup propagates to the caller.
+
+## Configuration and bounds
+
+| Setting | Default | Accepted range |
+| --- | ---: | ---: |
+| `cache_ttl` | 5 seconds | 0–300 seconds |
+| `max_cache_services` | 128 | 1–1,024 services |
+| `page_size` | 100 | 1–500 EndpointSlices per request |
+| `max_pages` | 64 | 1–64 pages per lookup |
+| `request_timeout` | 5 seconds | 0.05–60 seconds per API request |
+
+At most 4,096 endpoint records are processed per resolution. Cache refreshes for the same service
+are coalesced; up to 64 lock stripes bound the in-flight coordination state. Set `cache_ttl=0` to
+disable snapshot reuse. A nonzero TTL is a freshness window, not a watch or a guarantee that
+endpoints are healthy.
+
+## Kubernetes permissions
+
+The in-cluster identity needs only `list` on `endpointslices` in the selected namespace. A namespaced
+Role and RoleBinding are sufficient:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orbit-service-discovery
+  namespace: shop
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+```
+
+Bind this Role to the workload's dedicated ServiceAccount. Do not grant cluster-wide list access
+unless the application intentionally resolves across namespaces. The adapter does not watch
+EndpointSlices; each refresh performs a bounded list and follows continuation tokens.
+
+## Failure behavior
+
+- A Kubernetes 404 lookup returns an empty tuple; other API failures become sanitized
+  `DiscoveryError` values.
+- Page payloads larger than the requested page size, unsupported address types, invalid IP-family
+  data, or more than 4,096 endpoint records fail the lookup.
+- A `ready` value of `False` is filtered. `True` or unset readiness is eligible.
+- Only a matching named TCP port is returned. Other protocols and invalid port values are ignored.
+- Endpoints are deduplicated and sorted by host and port. The adapter does not load-balance, probe,
+  connect to, or retry endpoint requests.
+
+Validate the client version, namespace RoleBinding, service-account token rotation, real API
+timeouts, deployment proxy/egress controls, and shutdown during active requests in a representative
+cluster. Local fake-client tests do not validate a live cluster or production topology.

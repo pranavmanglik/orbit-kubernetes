@@ -12,14 +12,21 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = ["orbit-discovery>=0.1.0a1,<0.2"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
 kubernetes = ["kubernetes-asyncio>=36.1,<37"]
-dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1", "mypy>=1.13,<2", "build>=1.2,<2"]
+dev = [
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.24,<2",
+  "ruff>=0.8,<1",
+  "mypy>=1.13,<2",
+  "build>=1.2,<2",
+  "PyYAML>=6,<7",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orbit_kubernetes"]
